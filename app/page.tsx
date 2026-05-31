@@ -16,6 +16,8 @@ type Row = CheckNameResult & {
   isDuplicate?: boolean;
 };
 
+type ExportFilter = "Available" | "Taken" | "Error";
+
 type StreamEvent =
   | { type: "progress"; processed: number; total: number }
   | { type: "result"; result: CheckNameResult }
@@ -40,12 +42,14 @@ type StreamEvent =
 
 export default function Home() {
   const MAX_RETRY_PASSES = 5;
+  const exportFilters: ExportFilter[] = ["Available", "Taken", "Error"];
   const [input, setInput] = useState("");
   const [rows, setRows] = useState<Row[]>([]);
   const [progress, setProgress] = useState(0);
   const [progressText, setProgressText] = useState("Ready.");
   const [isChecking, setIsChecking] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [exportFilter, setExportFilter] = useState<ExportFilter>("Error");
   const [summary, setSummary] = useState<{
     processed: number;
     taken: number;
@@ -74,6 +78,10 @@ export default function Home() {
     () => rows.filter((row) => row.status === "Error").map((row) => row.name),
     [rows],
   );
+
+  const exportableNames = useMemo(() => {
+    return rows.filter((row) => row.status === exportFilter).map((row) => row.name);
+  }, [exportFilter, rows]);
 
   async function readNdjson(response: Response, onEvent: (event: StreamEvent) => void) {
     const reader = response.body?.getReader();
@@ -313,16 +321,16 @@ export default function Home() {
     if (errorNames.length > 0) void runCheck(errorNames);
   };
 
-  const downloadErrorNames = () => {
-    if (errorNames.length === 0) {
+  const downloadFilteredNames = () => {
+    if (exportableNames.length === 0) {
       return;
     }
 
-    const blob = new Blob([errorNames.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+    const blob = new Blob([exportableNames.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    link.download = "error-names.txt";
+    link.download = `${exportFilter.toLowerCase()}-names.txt`;
     link.rel = "noopener";
     document.body.appendChild(link);
     link.click();
@@ -411,14 +419,30 @@ export default function Home() {
               >
                 Retry errors
               </button>
-              <button
-                type="button"
-                onClick={downloadErrorNames}
-                disabled={errorNames.length === 0}
-                className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Download error list
-              </button>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <label className="text-xs font-semibold uppercase tracking-[0.18em] text-[#9aa1a8]">
+                  Export filter
+                </label>
+                <select
+                  value={exportFilter}
+                  onChange={(event) => setExportFilter(event.target.value as ExportFilter)}
+                  className="border-4 border-[#2a2f2a] bg-[#111418] px-4 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] outline-none"
+                >
+                  {exportFilters.map((filter) => (
+                    <option key={filter} value={filter}>
+                      {filter}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={downloadFilteredNames}
+                  disabled={exportableNames.length === 0}
+                  className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Export filtered names
+                </button>
+              </div>
             </div>
 
             <div className="mt-5">
