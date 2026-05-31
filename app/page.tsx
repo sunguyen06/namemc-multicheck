@@ -1,246 +1,162 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import {
-  MAX_BATCH_SIZE,
-  CheckNameResult,
-  getStatusTone,
-  getValidationMessage,
-  isValidMinecraftUsername,
-  normalizeUsername,
-  toCacheKey,
-} from "@/lib/minecraft";
+import { useEffect, useMemo, useState } from "react";
+import { buildInitialRows, type JobRow } from "@/lib/job-utils";
+import type { JobRecord } from "@/lib/job-store";
+import { getStatusTone, normalizeUsername } from "@/lib/minecraft";
 
-type Row = CheckNameResult & {
-  rowKey: string;
-  isDuplicate?: boolean;
+type JobResponse = {
+  jobId: string;
+  job: JobRecord;
 };
 
-type StreamEvent =
-  | { type: "progress"; processed: number; total: number }
-  | { type: "result"; result: CheckNameResult }
-  | {
-      type: "summary";
-      total: number;
-      processed: number;
-      taken: number;
-      available: number;
-      invalid: number;
-      errors: number;
-    }
-  | { type: "done" };
+const STORAGE_KEY = "namemc-multicheck:last-job-id";
 
 export default function Home() {
   const [input, setInput] = useState("");
-  const [rows, setRows] = useState<Row[]>([]);
-  const [progress, setProgress] = useState(0);
-  const [progressText, setProgressText] = useState("Ready.");
-  const [isChecking, setIsChecking] = useState(false);
-  const [notice, setNotice] = useState<string | null>(null);
-  const [summary, setSummary] = useState<{
-    processed: number;
-    taken: number;
-    available: number;
-    invalid: number;
-    errors: number;
-  } | null>(null);
+  const [jobId, setJobId] = useState<string | null>(() => {
+    if (typeof window === "undefined") {
+      return null;
+    }
+
+    return window.localStorage.getItem(STORAGE_KEY);
+  });
+  const [job, setJob] = useState<JobRecord | null>(null);
+  const [isCreating, setIsCreating] = useState(false);
+  const [statusMessage, setStatusMessage] = useState<string>("Ready.");
+  const [error, setError] = useState<string | null>(null);
 
   const inputCount = useMemo(
     () => input.split(/\r?\n/).map((line) => normalizeUsername(line)).filter(Boolean).length,
     [input],
   );
 
-  const counts = useMemo(() => {
-    const next = { taken: 0, available: 0, invalid: 0, error: 0 };
-    for (const row of rows) {
-      if (row.status === "Taken") next.taken += 1;
-      if (row.status === "Available") next.available += 1;
-      if (row.status === "Invalid") next.invalid += 1;
-      if (row.status === "Error") next.error += 1;
-    }
-    return next;
-  }, [rows]);
-
-  async function readNdjson(response: Response, onEvent: (event: StreamEvent) => void) {
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error("Streaming response not supported in this browser.");
+  const stats = useMemo(() => {
+    if (!job) {
+      return {
+        total: 0,
+        pending: 0,
+        taken: 0,
+        available: 0,
+        invalid: 0,
+        errors: 0,
+        progress: 0,
+      };
     }
 
-    const decoder = new TextDecoder();
-    let buffer = "";
+    const pending = job.rows.filter((row) => row.status === "Pending").length;
+    return {
+      total: job.rows.length,
+      pending,
+      taken: job.takenCount,
+      available: job.availableCount,
+      invalid: job.invalidCount,
+      errors: job.errorsCount,
+      progress: job.validCount === 0 ? 100 : Math.round((job.processedCount / job.validCount) * 100),
+    };
+  }, [job]);
 
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
+  const visibleRows = job?.rows ?? [];
 
-      buffer += decoder.decode(value, { stream: true });
-      let newlineIndex = buffer.indexOf("\n");
-
-      while (newlineIndex >= 0) {
-        const line = buffer.slice(0, newlineIndex).trim();
-        buffer = buffer.slice(newlineIndex + 1);
-        newlineIndex = buffer.indexOf("\n");
-
-        if (!line) continue;
-        onEvent(JSON.parse(line) as StreamEvent);
-      }
+  useEffect(() => {
+    if (!jobId) {
+      return;
     }
 
-    const tail = buffer.trim();
-    if (tail) onEvent(JSON.parse(tail) as StreamEvent);
-  }
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
-  function parseBatch(text: string) {
-    const entries = text.split(/\r?\n/).map((line) => normalizeUsername(line)).filter(Boolean);
-    const seen = new Set<string>();
-    const unique: string[] = [];
-    const rows: Row[] = [];
-    let duplicates = 0;
-
-    for (const entry of entries) {
-      const key = toCacheKey(entry);
-      if (seen.has(key)) {
-        duplicates += 1;
-        continue;
-      }
-
-      seen.add(key);
-
-      if (!isValidMinecraftUsername(entry)) {
-        rows.push({
-          rowKey: `invalid:${key}`,
-          name: entry,
-          normalizedName: entry,
-          status: "Invalid",
-          message: getValidationMessage(entry),
-        });
-        continue;
-      }
-
-      unique.push(entry);
-      rows.push({
-        rowKey: `pending:${key}`,
-        name: entry,
-        normalizedName: entry,
-        status: "Pending",
-        message: "Waiting in queue.",
-      });
-    }
-
-    return { unique, rows, duplicates };
-  }
-
-  function chunkNames(names: string[]) {
-    const chunks: string[][] = [];
-
-    for (let index = 0; index < names.length; index += MAX_BATCH_SIZE) {
-      chunks.push(names.slice(index, index + MAX_BATCH_SIZE));
-    }
-
-    return chunks;
-  }
-
-  async function runCheck(targetNames?: string[]) {
-    const source = targetNames ?? input.split(/\r?\n/);
-    const { unique, rows: initialRows, duplicates } = parseBatch(source.join("\n"));
-
-    setNotice(duplicates ? `Removed ${duplicates} duplicate${duplicates === 1 ? "" : "s"}.` : null);
-    setRows(initialRows);
-    setSummary(null);
-    setProgress(0);
-    setIsChecking(true);
-
-    try {
-      const chunks = chunkNames(unique);
-
-      if (chunks.length === 0) {
-        setProgress(100);
-        setProgressText("Done. 0 checked.");
-        setSummary({
-          processed: 0,
-          taken: 0,
-          available: 0,
-          invalid: initialRows.filter((row) => row.status === "Invalid").length,
-          errors: 0,
-        });
-        return;
-      }
-
-      let completedValid = 0;
-      let taken = 0;
-      let available = 0;
-      const invalid = initialRows.filter((row) => row.status === "Invalid").length;
-      let errors = 0;
-
-      setProgressText(`Checking ${unique.length} username${unique.length === 1 ? "" : "s"}...`);
-
-      for (const chunk of chunks) {
-        const response = await fetch("/api/check-names", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ names: chunk }),
-        });
-
+    const poll = async () => {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`, { cache: "no-store" });
         if (!response.ok) {
-          const data = (await response.json().catch(() => null)) as { error?: string } | null;
-          throw new Error(data?.error ?? `Request failed with HTTP ${response.status}.`);
+          throw new Error(`Job lookup failed with HTTP ${response.status}.`);
         }
 
-        await readNdjson(response, (event) => {
-          if (event.type === "progress") {
-            const overallProcessed = completedValid + event.processed;
-            const percent = unique.length === 0 ? 100 : Math.round((overallProcessed / unique.length) * 100);
-            setProgress(percent);
-            setProgressText(`Processed ${overallProcessed}/${unique.length}`);
-            return;
-          }
+        const data = (await response.json()) as JobResponse;
+        if (cancelled) {
+          return;
+        }
 
-          if (event.type === "result") {
-            setRows((current) =>
-              current.map((row) =>
-                row.name.toLowerCase() === event.result.name.toLowerCase()
-                  ? { ...event.result, rowKey: `done:${toCacheKey(event.result.name)}` }
-                  : row,
-              ),
-            );
+        setJob(data.job);
+        setStatusMessage(
+          data.job.status === "completed"
+            ? "Job completed."
+            : data.job.status === "running"
+              ? `Running. ${data.job.processedCount}/${data.job.validCount} valid names processed.`
+              : "Job queued and waiting for the worker.",
+        );
 
-            if (event.result.status === "Taken") taken += 1;
-            if (event.result.status === "Available") available += 1;
-            if (event.result.status === "Error") errors += 1;
-            return;
-          }
+        if (data.job.status === "completed" || data.job.status === "failed") {
+          return;
+        }
 
-          if (event.type === "summary") {
-            // Batch-level summary is folded into the final aggregate below.
-            return;
-          }
-        });
+        timer = setTimeout(poll, 5000);
+      } catch (pollError) {
+        if (!cancelled) {
+          setError(pollError instanceof Error ? pollError.message : "Failed to load job status.");
+          timer = setTimeout(poll, 10000);
+        }
+      }
+    };
 
-        completedValid += chunk.length;
+    void poll();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        clearTimeout(timer);
+      }
+    };
+  }, [jobId]);
+
+  async function startJob() {
+    const initial = buildInitialRows(input.split(/\r?\n/));
+    setIsCreating(true);
+    setError(null);
+    setStatusMessage("Creating background job...");
+
+    try {
+      const response = await fetch("/api/jobs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ names: input.split(/\r?\n/) }),
+      });
+
+      if (!response.ok) {
+        const data = (await response.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(data?.error ?? `Request failed with HTTP ${response.status}.`);
       }
 
-      setProgress(100);
-      setProgressText(`Done. ${unique.length} checked.`);
-      setSummary({
-        processed: unique.length,
-        taken,
-        available,
-        invalid,
-        errors,
-      });
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "Unexpected client error.");
-      setProgressText("Check failed.");
+      const data = (await response.json()) as JobResponse;
+      setJobId(data.jobId);
+      setJob(data.job);
+      window.localStorage.setItem(STORAGE_KEY, data.jobId);
+
+      const duplicateCount = initial.duplicateCount;
+      setStatusMessage(
+        data.job.status === "completed"
+          ? "Nothing to process. All names were invalid or duplicates."
+          : `Job started. ${duplicateCount ? `Removed ${duplicateCount} duplicate${duplicateCount === 1 ? "" : "s"}. ` : ""}This run will continue in the background.`,
+      );
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : "Failed to create job.");
+      setStatusMessage("Ready.");
     } finally {
-      setIsChecking(false);
+      setIsCreating(false);
     }
   }
 
-  const retryErrors = () => {
-    const errorNames = rows.filter((row) => row.status === "Error").map((row) => row.name);
-    if (errorNames.length > 0) void runCheck(errorNames);
-  };
+  function clearAll() {
+    setInput("");
+    setJobId(null);
+    setJob(null);
+    setError(null);
+    setStatusMessage("Ready.");
+    window.localStorage.removeItem(STORAGE_KEY);
+  }
 
   return (
     <main className="min-h-screen bg-[#141816] text-[#f4f4f2]">
@@ -252,10 +168,11 @@ export default function Home() {
             </div>
             <div>
               <div className="text-lg font-semibold leading-none">Bulk MC Name Check</div>
+              <div className="text-xs text-[#9aa1a8]">Background jobs for overnight runs</div>
             </div>
           </div>
           <div className="hidden text-xs text-[#9aa1a8] sm:block">
-            Requests are split into {MAX_BATCH_SIZE}-name chunks
+            {job ? `${job.validCount} valid names in progress` : "Queue-based, resumable processing"}
           </div>
         </header>
 
@@ -265,12 +182,12 @@ export default function Home() {
               <div>
                 <h1 className="text-2xl font-semibold tracking-tight text-white">Minecraft username bulk checker</h1>
                 <p className="mt-1 text-sm leading-6 text-[#a7adb5]">
-                  Paste one username per line, then check the list. Invalid names are flagged right away, duplicates are
-                  removed, and results come back one by one.
+                  Paste as many names as you want, start a background job, and let it continue overnight. You can close
+                  the page and reopen it later to resume the same run.
                 </p>
               </div>
               <div className="border-2 border-[#2b3138] bg-[#111418] px-3 py-2 text-xs text-[#c3c8cd]">
-                {progressText}
+                {statusMessage}
               </div>
             </div>
 
@@ -287,67 +204,54 @@ export default function Home() {
                 className="min-h-48 w-full border-4 border-[#2a2f2a] bg-[#101311] px-4 py-3 text-sm leading-6 text-white outline-none placeholder:text-[#6b7280] focus:border-[#8bbf5a]"
               />
               <div className="mt-2 text-xs text-[#8b929b]">
-                Press Enter to add more lines. Large lists are sent in 20-name chunks.
+                The app will create a background job and keep saving progress automatically.
               </div>
             </div>
 
             <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
               <button
                 type="button"
-                onClick={() => void runCheck()}
-                disabled={isChecking}
+                onClick={() => void startJob()}
+                disabled={isCreating}
                 className="border-4 border-[#0b0e0c] bg-[#9acb63] px-5 py-2.5 text-sm font-semibold text-[#0b0e0c] shadow-[4px_4px_0_0_rgba(0,0,0,0.35)] transition hover:translate-x-[1px] hover:translate-y-[1px] hover:shadow-[3px_3px_0_0_rgba(0,0,0,0.35)] disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {isChecking ? "Checking..." : "Check names"}
+                {isCreating ? "Starting..." : "Check names"}
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  setInput("");
-                  setRows([]);
-                  setProgress(0);
-                  setProgressText("Ready.");
-                  setNotice(null);
-                  setSummary(null);
-                }}
+                onClick={clearAll}
                 className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px]"
               >
                 Clear
-              </button>
-              <button
-                type="button"
-                onClick={retryErrors}
-                disabled={isChecking || rows.every((row) => row.status !== "Error")}
-                className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                Retry errors
               </button>
             </div>
 
             <div className="mt-5">
               <div className="mb-2 flex items-center justify-between text-xs text-[#9aa1a8]">
-                <span>{progressText}</span>
-                <span>{progress}%</span>
+                <span>
+                  {job
+                    ? `${job.status.toUpperCase()} · ${job.processedCount}/${job.validCount} valid processed`
+                    : "No job started yet."}
+                </span>
+                <span>{stats.progress}%</span>
               </div>
               <div className="h-3 border-2 border-[#2a2f2a] bg-[#0f1317]">
-                <div
-                  className="h-full bg-[#9acb63] transition-all duration-300"
-                  style={{ width: `${progress}%` }}
-                />
+                <div className="h-full bg-[#9acb63] transition-all duration-300" style={{ width: `${stats.progress}%` }} />
               </div>
             </div>
 
-            {notice ? (
-              <div className="mt-4 border-4 border-[#5a4a14] bg-[#2a2208] px-4 py-3 text-sm text-[#f4d06f]">
-                {notice}
+            {error ? (
+              <div className="mt-4 border-4 border-[#7f1d1d] bg-[#241316] px-4 py-3 text-sm text-[#fda4af]">
+                {error}
               </div>
             ) : null}
 
             <div className="mt-5 flex flex-wrap gap-2 text-xs text-[#c5cad0]">
-              <Pill label={`Taken ${counts.taken}`} />
-              <Pill label={`Available ${counts.available}`} />
-              <Pill label={`Invalid ${counts.invalid}`} />
-              <Pill label={`Errors ${counts.error}`} />
+              <Pill label={`Taken ${stats.taken}`} />
+              <Pill label={`Available ${stats.available}`} />
+              <Pill label={`Invalid ${stats.invalid}`} />
+              <Pill label={`Errors ${stats.errors}`} />
+              <Pill label={`Pending ${stats.pending}`} />
             </div>
 
             <div className="mt-6 overflow-hidden border-4 border-[#2a2f2a]">
@@ -360,18 +264,17 @@ export default function Home() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[#2a3037] bg-[#0f1317]">
-                  {rows.length === 0 ? (
+                  {visibleRows.length === 0 ? (
                     <tr>
                       <td colSpan={3} className="px-4 py-10 text-center text-[#78808a]">
-                        Results will appear here.
+                        Results will appear here once the job starts.
                       </td>
                     </tr>
                   ) : (
-                    rows.map((row) => (
+                    visibleRows.map((row) => (
                       <tr key={row.rowKey}>
                         <td className="px-4 py-3 text-white">
                           <div className="font-medium">{row.name}</div>
-                          {row.isDuplicate ? <div className="text-xs text-[#78808a]">Duplicate removed</div> : null}
                         </td>
                         <td className="px-4 py-3">
                           <StatusBadge status={row.status} />
@@ -392,19 +295,23 @@ export default function Home() {
 
             <div className="mt-5 border-4 border-[#2a2f2a] bg-[#0f1317] px-4 py-3">
               <div className="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-[#9aa1a8]">Output</div>
-              <div className="space-y-1 font-mono text-sm text-[#e5e7eb]">
-                {rows.length === 0 ? (
+              <div className="max-h-72 space-y-1 overflow-auto font-mono text-sm text-[#e5e7eb]">
+                {visibleRows.length === 0 ? (
                   <div className="text-[#78808a]">No output yet.</div>
                 ) : (
-                  rows.map((row) => <div key={`output:${row.rowKey}`}>{`${row.name} : ${row.status}`}</div>)
+                  visibleRows.map((row) => <div key={`output:${row.rowKey}`}>{`${row.name} : ${row.status}`}</div>)
                 )}
               </div>
             </div>
 
-            {summary ? (
+            {job ? (
               <div className="mt-5 text-xs text-[#9aa1a8]">
-                Checked {summary.processed}. Taken {summary.taken}. Available {summary.available}. Invalid{" "}
-                {summary.invalid}. Errors {summary.errors}.
+                Job ID: {jobId}
+                {" · "}
+                Submitted {job.totalSubmitted}. Duplicates removed {job.duplicateCount}.{" "}
+                {job.status === "completed"
+                  ? "The job is finished."
+                  : "The job will keep advancing automatically through cron."}
               </div>
             ) : null}
           </div>
@@ -418,7 +325,7 @@ function Pill({ label }: { label: string }) {
   return <span className="border-2 border-[#2a3037] bg-[#111418] px-3 py-1">{label}</span>;
 }
 
-function StatusBadge({ status }: { status: CheckNameResult["status"] }) {
+function StatusBadge({ status }: { status: JobRow["status"] }) {
   const tone = getStatusTone(status);
   const classes: Record<string, string> = {
     taken: "border-[#2f6f4b] bg-[#102118] text-[#86efac]",
