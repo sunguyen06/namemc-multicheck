@@ -70,6 +70,11 @@ export default function Home() {
     return next;
   }, [rows]);
 
+  const errorNames = useMemo(
+    () => rows.filter((row) => row.status === "Error").map((row) => row.name),
+    [rows],
+  );
+
   async function readNdjson(response: Response, onEvent: (event: StreamEvent) => void) {
     const reader = response.body?.getReader();
     if (!reader) {
@@ -305,8 +310,24 @@ export default function Home() {
   }
 
   const retryErrors = () => {
-    const errorNames = rows.filter((row) => row.status === "Error").map((row) => row.name);
     if (errorNames.length > 0) void runCheck(errorNames);
+  };
+
+  const downloadErrorNames = () => {
+    if (errorNames.length === 0) {
+      return;
+    }
+
+    const blob = new Blob([errorNames.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "error-names.txt";
+    link.rel = "noopener";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
   };
 
   return (
@@ -385,10 +406,18 @@ export default function Home() {
               <button
                 type="button"
                 onClick={retryErrors}
-                disabled={isChecking || rows.every((row) => row.status !== "Error")}
+                disabled={isChecking || errorNames.length === 0}
                 className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 Retry errors
+              </button>
+              <button
+                type="button"
+                onClick={downloadErrorNames}
+                disabled={errorNames.length === 0}
+                className="border-4 border-[#2a2f2a] bg-[#222622] px-5 py-2.5 text-sm font-semibold text-white shadow-[4px_4px_0_0_rgba(0,0,0,0.25)] transition hover:translate-x-[1px] hover:translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                Download error list
               </button>
             </div>
 
