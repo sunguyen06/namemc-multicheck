@@ -20,6 +20,13 @@ type StreamEvent =
   | { type: "progress"; processed: number; total: number }
   | { type: "result"; result: CheckNameResult }
   | {
+      type: "requeue";
+      name: string;
+      attempts: number;
+      retryInMs: number;
+      message: string;
+    }
+  | {
       type: "summary";
       total: number;
       processed: number;
@@ -211,6 +218,14 @@ export default function Home() {
             return;
           }
 
+          if (event.type === "requeue") {
+            setProgressText(
+              `${event.name} was rate-limited and re-queued (${event.attempts} attempt${event.attempts === 1 ? "" : "s"}).`,
+            );
+            setNotice(null);
+            return;
+          }
+
           if (event.type === "summary") {
             // Batch-level summary is folded into the final aggregate below.
             return;
@@ -287,7 +302,8 @@ export default function Home() {
                 className="min-h-48 w-full border-4 border-[#2a2f2a] bg-[#101311] px-4 py-3 text-sm leading-6 text-white outline-none placeholder:text-[#6b7280] focus:border-[#8bbf5a]"
               />
               <div className="mt-2 text-xs text-[#8b929b]">
-                Press Enter to add more lines. Large lists are sent in 20-name chunks.
+                Press Enter to add more lines. Large lists are queued and slowed automatically if the upstream API
+                starts rate limiting.
               </div>
             </div>
 

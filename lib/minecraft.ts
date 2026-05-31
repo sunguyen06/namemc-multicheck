@@ -24,6 +24,13 @@ export type CheckNamesResponseEvent =
       result: CheckNameResult;
     }
   | {
+      type: 'requeue';
+      name: string;
+      attempts: number;
+      retryInMs: number;
+      message: string;
+    }
+  | {
       type: 'summary';
       total: number;
       processed: number;

@@ -12,57 +12,92 @@ import {
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
+const MAX_REQUEUE_ATTEMPTS = 5;
+const MAX_REQUEUE_DELAY_MS = 30_000;
+
 type CacheEntry = {
   expiresAt: number;
   value: CheckNameResult;
 };
 
-const lookupCache = new Map<string, CacheEntry>();
-const inflightLookups = new Map<string, Promise<CheckNameResult>>();
-let throttleChain: Promise<void> = Promise.resolve();
+type LookupValue = CheckNameResult | LookupOutcome;
 
-function enqueueLookup(task: () => Promise<CheckNameResult>) {
-  const run = throttleChain.then(async () => {
-    try {
-      return await task();
-    } finally {
-      await new Promise((resolve) => setTimeout(resolve, THROTTLE_DELAY_MS));
+type LookupOutcome =
+  | {
+      kind: "result";
+      result: CheckNameResult;
     }
-  });
+  | {
+      kind: "rate-limited";
+      retryAfterMs: number;
+      message: string;
+    };
 
-  throttleChain = run.then(
-    () => undefined,
-    () => undefined,
-  );
+type QueueItem = {
+  name: string;
+  attempts: number;
+  availableAt: number;
+};
 
-  return run;
+const lookupCache = new Map<string, CacheEntry>();
+const inflightLookups = new Map<string, Promise<LookupValue>>();
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function fetchMojangProfile(name: string): Promise<CheckNameResult> {
+function parseRetryAfter(header: string | null) {
+  if (!header) {
+    return null;
+  }
+
+  const seconds = Number(header);
+  if (Number.isFinite(seconds)) {
+    return Math.max(0, seconds * 1000);
+  }
+
+  const retryAt = Date.parse(header);
+  if (!Number.isNaN(retryAt)) {
+    return Math.max(0, retryAt - Date.now());
+  }
+
+  return null;
+}
+
+async function lookupMojangProfile(name: string): Promise<LookupOutcome> {
   const normalizedName = normalizeUsername(name);
   const cacheKey = toCacheKey(normalizedName);
   const now = Date.now();
   const cached = lookupCache.get(cacheKey);
 
   if (cached && cached.expiresAt > now) {
-    return cached.value;
+    return {
+      kind: "result",
+      result: cached.value,
+    };
   }
 
   const pending = inflightLookups.get(cacheKey);
   if (pending) {
-    return pending;
+    const pendingResult = await pending;
+    if ("kind" in pendingResult) {
+      return pendingResult;
+    }
+
+    return {
+      kind: "result",
+      result: pendingResult,
+    };
   }
 
-  const request = enqueueLookup(async () => {
-    const response = await fetch(
-      `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(normalizedName)}`,
-      {
-        headers: {
-          Accept: "application/json",
-        },
+  const request = fetch(
+    `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(normalizedName)}`,
+    {
+      headers: {
+        Accept: "application/json",
       },
-    );
-
+    },
+  ).then(async (response) => {
     if (response.ok) {
       const data = (await response.json()) as { id?: string; name?: string };
 
@@ -99,13 +134,18 @@ async function fetchMojangProfile(name: string): Promise<CheckNameResult> {
       return result;
     }
 
-    if (response.status === 429) {
+    if (response.status === 429 || response.status === 503) {
+      const retryAfterMs =
+        parseRetryAfter(response.headers.get("retry-after")) ??
+        Math.min(MAX_REQUEUE_DELAY_MS, THROTTLE_DELAY_MS * 2);
+
       return {
-        name: normalizedName,
-        normalizedName,
-        status: "Error",
-        message: "Mojang rate-limited this request. Try again later.",
-        retriable: true,
+        kind: "rate-limited",
+        retryAfterMs,
+        message:
+          response.status === 429
+            ? "Mojang rate-limited this request."
+            : "Mojang temporarily rejected this request.",
       };
     }
 
@@ -122,18 +162,29 @@ async function fetchMojangProfile(name: string): Promise<CheckNameResult> {
 
   try {
     const result = await request;
+    if ("kind" in result) {
+      return result;
+    }
+
     lookupCache.set(cacheKey, {
       value: result,
       expiresAt: Date.now() + CACHE_TTL_MS,
     });
-    return result;
+
+    return {
+      kind: "result",
+      result,
+    };
   } catch (error) {
     return {
-      name: normalizedName,
-      normalizedName,
-      status: "Error",
-      message: error instanceof Error ? error.message : "Unexpected network error.",
-      retriable: true,
+      kind: "result",
+      result: {
+        name: normalizedName,
+        normalizedName,
+        status: "Error",
+        message: error instanceof Error ? error.message : "Unexpected network error.",
+        retriable: true,
+      },
     };
   } finally {
     inflightLookups.delete(cacheKey);
@@ -155,12 +206,17 @@ async function streamCheckNames(names: string[]) {
     uniqueNames.push(name);
   }
 
-  const validNames = uniqueNames.filter((name) => isValidMinecraftUsername(name));
-  const invalidNames = uniqueNames.length - validNames.length;
+  const invalidNames = uniqueNames.filter((name) => !isValidMinecraftUsername(name)).length;
   let processed = 0;
   let taken = 0;
   let available = 0;
   let errors = 0;
+  let nextRequestAt = Date.now();
+  const queue: QueueItem[] = uniqueNames.map((name) => ({
+    name,
+    attempts: 0,
+    availableAt: 0,
+  }));
 
   const encoder = new TextEncoder();
 
@@ -170,21 +226,90 @@ async function streamCheckNames(names: string[]) {
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
       };
 
-      for (const name of uniqueNames) {
-        const normalizedName = normalizeUsername(name);
-        let result: CheckNameResult;
+      while (queue.length > 0) {
+        queue.sort((left, right) => left.availableAt - right.availableAt);
+        const nextItem = queue.shift();
+
+        if (!nextItem) {
+          break;
+        }
+
+        const waitUntil = Math.max(nextItem.availableAt, nextRequestAt);
+        const waitMs = Math.max(0, waitUntil - Date.now());
+        if (waitMs > 0) {
+          await sleep(waitMs);
+        }
+
+        const normalizedName = normalizeUsername(nextItem.name);
 
         if (!isValidMinecraftUsername(normalizedName)) {
-          result = {
+          const result: CheckNameResult = {
             name: normalizedName,
             normalizedName,
             status: "Invalid",
             message: getValidationMessage(normalizedName),
           };
-        } else {
-          result = await fetchMojangProfile(normalizedName);
+
+          processed += 1;
+          write({
+            type: "progress",
+            processed,
+            total: uniqueNames.length,
+          });
+          write({
+            type: "result",
+            result,
+          });
+          nextRequestAt = Date.now() + THROTTLE_DELAY_MS;
+          continue;
         }
 
+        const lookup = await lookupMojangProfile(normalizedName);
+
+        if (lookup.kind === "rate-limited") {
+          nextItem.attempts += 1;
+
+          if (nextItem.attempts > MAX_REQUEUE_ATTEMPTS) {
+            const result: CheckNameResult = {
+              name: normalizedName,
+              normalizedName,
+              status: "Error",
+              message: `${lookup.message} Requeue limit reached after ${MAX_REQUEUE_ATTEMPTS} attempts.`,
+              retriable: true,
+            };
+
+            processed += 1;
+            errors += 1;
+            write({
+              type: "progress",
+              processed,
+              total: uniqueNames.length,
+            });
+            write({
+              type: "result",
+              result,
+            });
+            nextRequestAt = Date.now() + THROTTLE_DELAY_MS;
+            continue;
+          }
+
+          const retryInMs = Math.max(THROTTLE_DELAY_MS, lookup.retryAfterMs);
+          nextItem.availableAt = Date.now() + retryInMs;
+          queue.push(nextItem);
+
+          write({
+            type: "requeue",
+            name: normalizedName,
+            attempts: nextItem.attempts,
+            retryInMs,
+            message: lookup.message,
+          });
+
+          nextRequestAt = Date.now() + THROTTLE_DELAY_MS;
+          continue;
+        }
+
+        const result = lookup.result;
         processed += 1;
         if (result.status === "Taken") taken += 1;
         if (result.status === "Available") available += 1;
