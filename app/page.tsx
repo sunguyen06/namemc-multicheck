@@ -33,11 +33,13 @@ type StreamEvent =
       taken: number;
       available: number;
       invalid: number;
+      requeued: number;
       errors: number;
     }
   | { type: "done" };
 
 export default function Home() {
+  const MAX_RETRY_PASSES = 5;
   const [input, setInput] = useState("");
   const [rows, setRows] = useState<Row[]>([]);
   const [progress, setProgress] = useState(0);
@@ -159,86 +161,136 @@ export default function Home() {
     setIsChecking(true);
 
     try {
-      const chunks = chunkNames(unique);
+      let passNames = unique;
+      let passNumber = 1;
+      let taken = 0;
+      let available = 0;
+      const invalid = initialRows.filter((row) => row.status === "Invalid").length;
+      let errors = 0;
 
-      if (chunks.length === 0) {
+      if (passNames.length === 0) {
         setProgress(100);
         setProgressText("Done. 0 checked.");
         setSummary({
           processed: 0,
           taken: 0,
           available: 0,
-          invalid: initialRows.filter((row) => row.status === "Invalid").length,
+          invalid,
           errors: 0,
         });
         return;
       }
 
-      let completedValid = 0;
-      let taken = 0;
-      let available = 0;
-      const invalid = initialRows.filter((row) => row.status === "Invalid").length;
-      let errors = 0;
+      while (passNames.length > 0 && passNumber <= MAX_RETRY_PASSES) {
+        const chunks = chunkNames(passNames);
+        const retryQueue = new Set<string>();
 
-      setProgressText(`Checking ${unique.length} username${unique.length === 1 ? "" : "s"}...`);
+        setProgressText(
+          passNumber === 1
+            ? `Checking ${passNames.length} username${passNames.length === 1 ? "" : "s"}...`
+            : `Retry pass ${passNumber}: checking ${passNames.length} requeued username${
+                passNames.length === 1 ? "" : "s"
+              }...`,
+        );
 
-      for (const chunk of chunks) {
-        const response = await fetch("/api/check-names", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ names: chunk }),
-        });
+        let completedInPass = 0;
 
-        if (!response.ok) {
-          const data = (await response.json().catch(() => null)) as { error?: string } | null;
-          throw new Error(data?.error ?? `Request failed with HTTP ${response.status}.`);
+        for (const chunk of chunks) {
+          let chunkCompleted = 0;
+          const response = await fetch("/api/check-names", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ names: chunk }),
+          });
+
+          if (!response.ok) {
+            const data = (await response.json().catch(() => null)) as { error?: string } | null;
+            throw new Error(data?.error ?? `Request failed with HTTP ${response.status}.`);
+          }
+
+          await readNdjson(response, (event) => {
+            if (event.type === "progress") {
+              const overallProcessed = completedInPass + event.processed;
+              const percent = passNames.length === 0 ? 100 : Math.round((overallProcessed / passNames.length) * 100);
+              setProgress(percent);
+              setProgressText(
+                passNumber === 1
+                  ? `Processed ${overallProcessed}/${passNames.length}`
+                  : `Retry pass ${passNumber}: ${overallProcessed}/${passNames.length}`,
+              );
+              return;
+            }
+
+            if (event.type === "result") {
+              setRows((current) =>
+                current.map((row) =>
+                  row.name.toLowerCase() === event.result.name.toLowerCase()
+                    ? { ...event.result, rowKey: `done:${toCacheKey(event.result.name)}` }
+                    : row,
+                ),
+              );
+
+              if (event.result.status === "Taken") taken += 1;
+              if (event.result.status === "Available") available += 1;
+              if (event.result.status === "Error") errors += 1;
+              return;
+            }
+
+            if (event.type === "requeue") {
+              retryQueue.add(normalizeUsername(event.name));
+              setNotice(
+                `Queued ${retryQueue.size} name${retryQueue.size === 1 ? "" : "s"} for retry pass ${
+                  passNumber + 1
+                }.`,
+              );
+              setProgressText(
+                `${event.name} was rate-limited. Retrying in ${Math.max(1, Math.ceil(event.retryInMs / 1000))}s.`,
+              );
+              return;
+            }
+
+            if (event.type === "summary") {
+              chunkCompleted = event.processed;
+              return;
+            }
+          });
+
+          completedInPass += chunkCompleted;
         }
 
-        await readNdjson(response, (event) => {
-          if (event.type === "progress") {
-            const overallProcessed = completedValid + event.processed;
-            const percent = unique.length === 0 ? 100 : Math.round((overallProcessed / unique.length) * 100);
-            setProgress(percent);
-            setProgressText(`Processed ${overallProcessed}/${unique.length}`);
-            return;
-          }
+        const nextPass = Array.from(retryQueue);
+        if (nextPass.length === 0) {
+          break;
+        }
 
-          if (event.type === "result") {
-            setRows((current) =>
-              current.map((row) =>
-                row.name.toLowerCase() === event.result.name.toLowerCase()
-                  ? { ...event.result, rowKey: `done:${toCacheKey(event.result.name)}` }
-                  : row,
-              ),
-            );
-
-            if (event.result.status === "Taken") taken += 1;
-            if (event.result.status === "Available") available += 1;
-            if (event.result.status === "Error") errors += 1;
-            return;
-          }
-
-          if (event.type === "requeue") {
-            setProgressText(
-              `${event.name} was rate-limited and re-queued (${event.attempts} attempt${event.attempts === 1 ? "" : "s"}).`,
-            );
-            setNotice(null);
-            return;
-          }
-
-          if (event.type === "summary") {
-            // Batch-level summary is folded into the final aggregate below.
-            return;
-          }
-        });
-
-        completedValid += chunk.length;
+        passNames = nextPass;
+        passNumber += 1;
       }
 
+      if (passNames.length > 0) {
+        const stillPending = passNames.map((name) => name.toLowerCase());
+        setRows((current) =>
+          current.map((row) =>
+            stillPending.includes(row.name.toLowerCase()) && row.status === "Pending"
+              ? {
+                  ...row,
+                  status: "Error",
+                  message: `Still rate-limited after ${MAX_RETRY_PASSES} retry passes.`,
+                  retriable: true,
+                  rowKey: `done:${toCacheKey(row.name)}`,
+                }
+              : row,
+          ),
+        );
+        errors += passNames.length;
+        setNotice(`Some names stayed rate-limited after ${MAX_RETRY_PASSES} passes.`);
+      }
+
+      const processed = taken + available + invalid + errors;
       setProgress(100);
-      setProgressText(`Done. ${unique.length} checked.`);
+      setProgressText(`Done. ${processed} checked.`);
       setSummary({
-        processed: unique.length,
+        processed,
         taken,
         available,
         invalid,

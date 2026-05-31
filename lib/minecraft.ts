@@ -37,6 +37,7 @@ export type CheckNamesResponseEvent =
       taken: number;
       available: number;
       invalid: number;
+      requeued: number;
       errors: number;
     }
   | {
